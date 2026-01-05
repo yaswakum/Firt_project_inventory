@@ -1,0 +1,80 @@
+from langgraph.graph import StateGraph, START, END
+from typing_extensions import TypedDict
+from langchain_openai import ChatOpenAI
+
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+llm = ChatOpenAI(model="gpt-4")
+
+import paramiko
+import time
+
+SSH_HOST = "x.x.x.x"
+SSH_PORT = 22
+SSH_USER = "onprem"
+SSH_PASSWORD = "xxxxxx"
+
+SUDO_PASSWORD = "xxxxxx"   # usually same
+MYSQL_PASSWORD = "xxxxxx"
+
+MYSQL_CMD = """
+cd /opt/cisco/ss/adminshell/applications/CSPC/database/mysql/bin
+./mysql -u root paridb -p
+"""
+
+QUERY = "select * from discovered_devices;"
+
+def run():
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(SSH_HOST, port=SSH_PORT, username=SSH_USER, password=SSH_PASSWORD)
+
+    shell = ssh.invoke_shell()
+    time.sleep(1)
+
+    shell.send("sudo -i\n")
+    time.sleep(1)
+    shell.send(f"{SUDO_PASSWORD}\n")
+    time.sleep(1)
+
+    shell.send(f"{MYSQL_CMD}\n")
+    time.sleep(2)
+    shell.send(f"{MYSQL_PASSWORD}\n")
+    time.sleep(2)
+
+    shell.send(f"{QUERY}\n")
+    time.sleep(2)
+
+    output = shell.recv(65535).decode()
+    print(output)
+
+    shell.send("exit\n")
+    time.sleep(1)
+    shell.send("exit\n")
+
+    ssh.close()
+    
+    return output
+
+def ask_llm(question, db_output):
+    prompt = f"""
+You are an expert database administrator. You have access to the following database output and provide the answer to the question based on that.
+{db_output}
+
+Question: {question}
+Provide a concise and accurate answer based on the database output."""
+    
+    return llm.invoke(prompt).content
+
+def main():
+    db_output = run()
+    question = "How many hostnames are present and print the hostnames and OS version and product family?"
+    answer = ask_llm(question, db_output)
+    print("LLM Answer:", answer)
+
+if __name__ == "__main__":
+    main()
