@@ -1,0 +1,277 @@
+from langgraph.graph import StateGraph, START, END
+from typing_extensions import TypedDict
+from langchain_openai import ChatOpenAI
+
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+llm = ChatOpenAI(model="gpt-4")
+
+import paramiko
+import time
+
+SSH_HOST = "10.225.232.91"
+SSH_PORT = 2216
+SSH_USER = "onprem"
+SSH_PASSWORD = "Airgap@123"
+
+SUDO_PASSWORD = "Airgap@123"   # usually same
+MYSQL_PASSWORD = "+w45uBRo"
+
+MYSQL_CMD = """
+cd /opt/cisco/ss/adminshell/applications/CSPC/database/mysql/bin
+./mysql -u root paridb -p
+"""
+
+#QUERY = "select * from discovered_devices;"
+
+def run(query: str)-> str:
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(SSH_HOST, port=SSH_PORT, username=SSH_USER, password=SSH_PASSWORD, timeout=10)
+
+        shell = ssh.invoke_shell()
+        time.sleep(1)
+
+        shell.send("sudo -i\n")
+        time.sleep(1)
+        shell.send(f"{SUDO_PASSWORD}\n")
+        time.sleep(1)
+
+        shell.send(f"{MYSQL_CMD}\n")
+        time.sleep(2)
+        shell.send(f"{MYSQL_PASSWORD}\n")
+        time.sleep(2)
+
+        shell.send(f"{query}\n")
+        time.sleep(2)
+
+        output = shell.recv(65535).decode()
+        print(output)
+
+        shell.send("exit\n")
+        time.sleep(1)
+        shell.send("exit\n")
+
+        ssh.close()
+        
+        return output
+    except TimeoutError:
+        error_msg = f"Connection timeout: Unable to reach {SSH_HOST}:{SSH_PORT}. Please check if the server is reachable."
+        print(error_msg)
+        return error_msg
+    except Exception as e:
+        error_msg = f"Error connecting to SSH: {str(e)}"
+        print(error_msg)
+        return error_msg
+
+
+def fetch_devices_data():
+    """ Fetch device inventory details.
+
+    Use this tool when the user asks about:
+    - hostnames
+    - devices
+    - OS version or os_name
+    - product family or product_model
+    - hardware or software inventory
+    - snmp_object_id is also called as sysObjectID
+    """
+    query = "select * from discovered_devices;"
+
+    return run(query)
+
+def fetch_users_data():
+    """ This will contain list of users details whenever user asked about users details
+    fetch from DB and return as a formatted string. Dont print "auth_type"," last_pwd_change_time"because these are very Confidential, show them only login details only.
+    """
+    query = "select login,name from user_details;"
+
+    return run(query)
+
+def create_seedfile_remote(hostnames: list[str]) -> str:
+    '''if user ask to add devices then use this tool to create seedfile on remote server.'''
+    
+    file_path = "/home/onprem/seedfile.txt"
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            SSH_HOST,
+            port=SSH_PORT,
+            username=SSH_USER,
+            password=SSH_PASSWORD,
+            timeout=10
+        )
+
+        shell = ssh.invoke_shell()
+        time.sleep(1)
+
+        shell.send(f"cat > {file_path} << 'EOF'\n")
+        time.sleep(1)
+
+        for hostname in hostnames:
+            shell.send(f"{hostname}{',' * 35}\n")
+
+        shell.send("EOF\n")
+        time.sleep(1)
+
+        ssh.close()
+        return f"Seed file created successfully at {file_path}"
+
+    except Exception as e:
+        return f"Failed to create seed file: {str(e)}"
+
+
+
+
+class GraphState(TypedDict):
+    question: str
+    devices_data: str
+    users_data: str
+    answer: str
+    next: str
+
+
+
+def router_node(state: GraphState) -> dict:
+    question_lower = state["question"].lower()
+
+    # 🔒 HARD RULE (DETERMINISTIC)
+    if "add seedfile" in question_lower or "add devices" in question_lower:
+        print("ROUTER DECISION: add_seedfile (keyword match)")
+        return {**state, "next": "add_seedfile"}
+
+
+    prompt = f"""
+You are a routing agent.
+
+Question:
+{state["question"]}
+
+Available tools:
+- fetch_devices: device inventory, hostnames, OS version, product family
+- fetch_users: user login and account information
+- create_seedfile_remote: create a seed file on remote server with given hostnames
+
+Return ONLY the tool name.
+"""
+
+    decision = llm.invoke(prompt).content.strip()
+
+    if decision not in ["fetch_devices", "fetch_users"]:
+        decision = "fetch_devices"
+
+    print("ROUTER DECISION:", decision)
+    return {**state, "next": decision}
+
+def route_after_router(state: GraphState) -> str:
+    return state["next"]
+
+def devices_node(state: GraphState):
+    print("FETCHING DEVICE DATA")
+    return {
+        **state,
+        "devices_data": fetch_devices_data()
+    }
+
+def users_node(state: GraphState):
+    print("FETCHING USER DATA")
+    return {
+        **state,
+        "users_data": fetch_users_data()
+    
+    }
+
+def seedfile_node(state: GraphState):
+    confirm = input("\nDo you want to add seedfile? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        return {
+            **state,
+            "answer": "Seedfile creation cancelled"
+        }
+
+    hosts_input = input("\nEnter hostnames/devices (comma separated): ")
+    hostnames = [h.strip() for h in hosts_input.split(",") if h.strip()]
+
+    if not hostnames:
+        return {
+            **state,
+            "answer": "No hostnames provided"
+        }
+
+    result = create_seedfile_remote(hostnames)
+    return {
+        **state,
+        "answer": result
+    }
+
+def llm_node(state: GraphState):
+    prompt = f"""
+Devices Data:
+{state.get("devices_data", "N/A")}
+
+Users Data:
+{state.get("users_data", "N/A")}
+
+Question:
+{state["question"]}
+
+Rules:
+- Answer ONLY from the data above
+- If information is missing, say "Not found in database"
+"""
+
+    answer = llm.invoke(prompt).content
+    return {
+        **state,
+        "answer": answer
+    }
+
+graph = StateGraph(GraphState)
+
+graph.add_node("router", router_node)
+graph.add_node("fetch_devices", devices_node)
+graph.add_node("fetch_users", users_node)
+graph.add_node("add_seedfile", seedfile_node)
+graph.add_node("llm", llm_node)
+
+graph.add_edge(START, "router")
+
+graph.add_conditional_edges(
+    "router",
+    route_after_router,
+    {
+        "fetch_devices": "fetch_devices",
+        "fetch_users": "fetch_users",
+        "add_seedfile": "add_seedfile",
+    }
+)
+
+graph.add_edge("fetch_devices", "llm")
+graph.add_edge("fetch_users", "llm")
+graph.add_edge("llm", END)
+graph.add_edge("add_seedfile", END)
+
+app = graph.compile()
+
+# -------------------------------------------------
+# EXECUTION
+# -------------------------------------------------
+if __name__ == "__main__":
+    while True:
+        user_question = input("\nAsk a question (or type 'exit'): ")
+        if user_question.lower() == "exit":
+            break
+
+        result = app.invoke({
+            "question": user_question
+        })
+
+        print("\nFINAL ANSWER:\n")
+        print(result["answer"])
